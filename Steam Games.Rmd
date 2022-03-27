@@ -1,0 +1,110 @@
+---
+title: "Steam Games Tidy Tuesday"
+author: "Matt Defenderfer"
+date: "2/21/2022"
+output: html_document
+---
+
+# Setup
+
+## Load Libraries
+
+```{r libraries}
+library(tidytuesdayR)
+library(jsonlite)
+library(janitor)
+library(tidyverse)
+```
+
+## Load Steam and TidyTuesday Data
+```{r load tt data}
+# Load Tidy Tuesday data from github
+tt_output <- tidytuesdayR::tt_load('2021-03-16')
+
+games <- tt_output$games
+```
+
+```{r steam data}
+# Query all games and ids from steam api
+steam_apps <- jsonlite::fromJSON('https://api.steampowered.com/ISteamApps/GetAppList/v2/')
+game_list <- steam_apps$applist$apps %>%
+  distinct()
+```
+
+```{r merge data}
+games <- games %>%
+  rename(name = gamename) %>%
+  left_join(game_list, by = 'name') 
+```
+
+```{r fix date}
+# Combine year and month information and convert to lubridate date format.
+games <- games %>%
+  mutate(year = as.character(year),
+         date = lubridate::ym(paste0(year,'-',month))) %>%
+  select(-year,-month) %>%
+  relocate(date, .after = 'name')
+```
+
+
+### Duplicates
+
+Multiple games in the list seem to have been assigned multiple IDs over time. This is most likely due to special editions being released overwriting the main release (such as The Witcher: Enhanced Edition current steam version being the director's cut). This also may occur when a game leaves early access. Either way, there should only be a single active AppID for any given game. 
+
+One of the AppIDs, when queried in the API, should give a return `success` value of `false`. We'll first find the duplicates using `janitor::get_dupes`, then filter out the individual months and years to get distinct `name` and `appid` combinations.
+
+```{r duplicates}
+dupes <- games %>%
+  get_dupes(name:avg_peak_perc) %>%
+  select(name,appid) %>%
+  distinct()
+```
+
+Now, we can build API URLs and query each one, determining if the query return was a success or not. Then we will filter out the unsuccessful appids and only keep the ones that currently exist.
+
+```{r filter duplicates}
+get_json <- function (appid, base_api = 'https://store.steampowered.com/api/appdetails/?appids='){
+  app_url <- paste0(base_api,as.character(appid))
+  
+  app_list <- jsonlite::fromJSON(app_url) %>%
+    flatten()
+}
+
+dupes <- dupes %>%
+  mutate(json = map(appid, ~get_success(appid = .x)))
+
+dupes %>%
+  mutate(success = map_lgl(json, ~.$success)) %>%
+  filter(success) %>%
+  mutate(media = map_chr(json, ~.$data$type),
+         year_released = lubridate::mdy(map_chr(json, ~.$data$release_date$date))) %>%
+  filter(media == 'game')
+```
+
+At this point, we have filtered out all games which either did not have an API entry or did not have the "game" tage in the "type" field. From here, we need to check which names are still duplicated.
+
+```{r}
+dupes %>% 
+  filter(success) %>%
+  select(name) %>%
+  count(name) %>%
+  filter(n > 1)
+```
+
+Why are there still games which have multiple IDs after the filtering?
+
+1. Alpha Protocol has two IDs which both redirect to the 34010 AppID, so the 34019 ID will be filtered out.
+2. OneShot has two IDs associated for two completely different games. The 420350 ID is associated with a game with a high playerbase and came out in 2016, which matches play data from the original TT dataset. The 1221330 ID is associated with a very low playerbase game from 2020. The 420350 ID will be kept while the 1221330 ID will be removed.
+3. Outlast's 238320 ID is associated with the game in the TT dataset as it has data from 2013 when the game was released while the 1318840 ID came out in 2020 and has a completely different name of Outlast: Journey of a Gladiator. Not sure why that name wasn't kept in the original Steam game list scrape.
+4. For RIFT, the two IDs reference two completely different games with the same name. ID 1898320 has not released yet (as of February 2022) and so will be discarded.
+5. Sid Meier's Civilization IV: Beyond the Sword ID 34460 redirects to the 8800 webpage, so ID 8800 will be kept.
+6. Sid Meier's Civilization V ID 50100 redirects to the 8930 webpage, so ID 8930 will be kept.
+7. Total War: SHOGUN 2 ID 34330 redirects to the 201270 webpage, so ID 201270 will be kept.
+8. War Trigger 3 may have been rereleased in 2020, however the older webpage is still active. We have play data from 2015 for the game, and ID 298240 is associated with a game released in 2011, so it will be kept.
+
+The other IDs will be removed from the dataset.
+
+```{r}
+
+```
+
