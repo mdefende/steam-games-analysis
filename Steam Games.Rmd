@@ -16,42 +16,70 @@ library(janitor)
 library(tidyverse)
 ```
 
-## Load Steam and TidyTuesday Data
-```{r load tt data}
+## Introduction
+
+These data were originally posted in the Tidy Tuesday repo seen at [this link](https://github.com/rfordatascience/tidytuesday/tree/master/data/2021/2021-03-16). The original dataset contained monthly average and peak player count information on over 1200 games taken from the [Steam](https://store.steampowered.com/) software distribution platform. All games had values reported by month and year and had data for more than 1 month. 
+
+While longitudinal play rate data is useful, more information about each game would be useful for breaking down things like which genres are the most popular over time and for how long, how play rates interact with the game rating, and predicting play rate over time given genre, rating, and more. All of this information can be retrieved using the [Steam API](https://steamcommunity.com/dev). 
+
+A note about the Steam API is that it can only request current data, no historical data is accessible through the API. This limits some of the things we can do, since we only have cross-sectional data from the Steam database retrieved on February 22, 2022. Some of the analyses here could be improved if the scraping occurred every day and was stored in a database. This is what [SteamDB](https://steamdb.info/) does, but they do not have a functional API to download their stored longitudinal data. 
+
+## Data Loading and Cleaning
+
+The following `TidyTuesday Data` and `Steam Scraping and Cleaning` sections detail how I used the Tidy Tuesday dataset and Steam API to scrape information about each TT game and clean and sort the data. However, if you run these steps again, the data will be different due to scraping from the API on a different day. Therefore the data I used here is stored in the `game-info-02-22-2022.RData` file and will be loaded here. The rest of the section shows the steps used to generate the cleaned dataset, but are not evaluated.
+
+```{r load cleaned data}
+load('game-info-02-22-2022.RData')
+```
+
+
+### TidyTuesday Data
+
+TT data can be loaded using the `tidytuesdayR` R package, specifying the date the dataset was published in the repo. The `games` data is then extracted from the `tt_output` object.
+
+```{r load tt data, eval = FALSE}
 # Load Tidy Tuesday data from github
 tt_output <- tidytuesdayR::tt_load('2021-03-16')
-
 games <- tt_output$games
 ```
 
-```{r steam data}
-# Query all games and ids from steam api
-steam_apps <- jsonlite::fromJSON('https://api.steampowered.com/ISteamApps/GetAppList/v2/')
-game_list <- steam_apps$applist$apps %>%
-  distinct()
-```
+The date information is stored in separate columns, so we will combine those here and convert to a date format.
 
-```{r merge data}
-games <- games %>%
-  rename(name = gamename) %>%
-  left_join(game_list, by = 'name') 
-```
-
-```{r fix date}
+```{r fix date, eval = FALSE}
 # Combine year and month information and convert to lubridate date format.
 games <- games %>%
   mutate(year = as.character(year),
          date = lubridate::ym(paste0(year,'-',month))) %>%
   select(-year,-month) %>%
-  relocate(date, .after = 'name')
+  relocate(date, .after = 'gamename')
+```
+
+### Steam Data
+
+In order to get data for a game from the Steam API, an appID for the game is needed. The appID is a unique identifying number assigned to each piece of software hosted on the platform. This ID is the thing used to request data from the API. We can query the names and appIDs for each piece of software using the `GetAppList` method for the Web API. We then remove duplicate rows, and join the appID information to the main dataframe.
+
+```{r steam data, eval = FALSE}
+# Query all games and ids from steam api
+steam_apps <- jsonlite::fromJSON('https://api.steampowered.com/ISteamApps/GetAppList/v2/')
+game_list <- steam_apps$applist$apps %>%
+  distinct()
+
+# Add appID value for each game to the main dataframe, only keeping rows from the TT data.
+games <- games %>%
+  rename(name = gamename) %>%
+  left_join(game_list, by = 'name') 
+
+# Remove games with NA for appID
+games <- games %>%
+  filter(!is.na(appid))
 ```
 
 
-### Duplicates
+#### Remove Duplicates
 
-Multiple games in the list seem to have been assigned multiple IDs over time. This is most likely due to special editions being released overwriting the main release (such as The Witcher: Enhanced Edition current steam version being the director's cut). This also may occur when a game leaves early access. Either way, there should only be a single active AppID for any given game. 
+Multiple games in the list seem to have been assigned multiple appIDs over time. This is most likely due to special editions being released overwriting the main release (such as The Witcher: Enhanced Edition current steam version being the director's cut). This also may occur when a game leaves early access. Either way, there should only be a single active AppID for any given game.
 
-One of the AppIDs, when queried in the API, should give a return `success` value of `false`. We'll first find the duplicates using `janitor::get_dupes`, then filter out the individual months and years to get distinct `name` and `appid` combinations.
+If a single game was assigned multiple IDs over time and only one is currently active, one of the should return a `success` value of `false` when queried in the API. We'll first games with duplicated data but different AppIDs using `janitor::get_dupes` then keep the distinct combinations of `name` and `appid`.
 
 ```{r duplicates}
 dupes <- games %>%
@@ -62,31 +90,46 @@ dupes <- games %>%
 
 Now, we can build API URLs and query each one, determining if the query return was a success or not. Then we will filter out the unsuccessful appids and only keep the ones that currently exist.
 
-```{r filter duplicates}
-get_json <- function (appid, base_api = 'https://store.steampowered.com/api/appdetails/?appids='){
+```{r filter duplicates, eval = FALSE}
+# function to retrieve game data from Steam API
+get_steam_info <- function (appid, base_api = 'https://store.steampowered.com/api/appdetails/?appids='){
   app_url <- paste0(base_api,as.character(appid))
   
   app_list <- jsonlite::fromJSON(app_url) %>%
     flatten()
+  
+  # sleep for 1 second in between calls to try and prevent API calls from being rejected for rate limit
+  Sys.sleep(1)
 }
 
+# retrieve steam data for each entry here and extract success value
 dupes <- dupes %>%
-  mutate(json = map(appid, ~get_success(appid = .x)))
+  mutate(json = map(appid, ~get_steam_info(appid = .x)),
+         success = map_lgl(json, ~.$success))
 
-dupes %>%
-  mutate(success = map_lgl(json, ~.$success)) %>%
+# get names and appIDs for each application that returns a false success value
+no_success <- dupes %>%
+  filter(!success) %>%
+  select(name,appid)
+
+# some applications return a success but are not classified as games
+not_games <- dupes %>%
   filter(success) %>%
-  mutate(media = map_chr(json, ~.$data$type),
-         year_released = lubridate::mdy(map_chr(json, ~.$data$release_date$date))) %>%
+  mutate(media = map_chr(json, ~.$data$type)) %>%
+  filter(media != 'game') %>%
+  select(name,appid)
+
+# get list of remaining games
+dupe_games <- dupes %>%
+  filter(success) %>%
+  mutate(media = map_chr(json, ~.$data$type)) %>%
   filter(media == 'game')
 ```
 
-At this point, we have filtered out all games which either did not have an API entry or did not have the "game" tage in the "type" field. From here, we need to check which names are still duplicated.
+At this point, we have filtered out all games which either did not have an API entry or did not have the "game" tag in the "type" field. From here, we need to check which names are still duplicated.
 
 ```{r}
-dupes %>% 
-  filter(success) %>%
-  select(name) %>%
+dupe_games %>% 
   count(name) %>%
   filter(n > 1)
 ```
@@ -100,11 +143,42 @@ Why are there still games which have multiple IDs after the filtering?
 5. Sid Meier's Civilization IV: Beyond the Sword ID 34460 redirects to the 8800 webpage, so ID 8800 will be kept.
 6. Sid Meier's Civilization V ID 50100 redirects to the 8930 webpage, so ID 8930 will be kept.
 7. Total War: SHOGUN 2 ID 34330 redirects to the 201270 webpage, so ID 201270 will be kept.
-8. War Trigger 3 may have been rereleased in 2020, however the older webpage is still active. We have play data from 2015 for the game, and ID 298240 is associated with a game released in 2011, so it will be kept.
+8. War Trigger 3 may have been rereleased in 2020, however the older webpage is still active. We have play data from 2015 for the game, and ID 298240 is associated with a game released in 2011, so it will be kept. 1210360 will be removed.
 
 The other IDs will be removed from the dataset.
 
 ```{r}
+# manually remove remaining duplicate games
+dupe_games <- dupe_games %>%
+  filter(appid %in% c(34019,1221330,1318840,1898320,34460,50100,34330,1210360)) %>% 
+  select(name,appid)
 
+# combine the duplicate games, non-games, and those without API entries
+rem_games <- bind_rows(no_success,not_games,dupe_games)
+
+# remove these games from the original games list
+games <- games %>% 
+  filter(!(appid %in% rem_games$appid))
+```
+
+### Read Steam API Information
+
+At this point, we only have names and AppIDs for real games in the original TT dataset. Here, we will go ahead and read in Steam info for each of the games using the `get_steam_info` function from earlier.
+
+```{r}
+# query steam info for each game
+game_info <- games %>%
+  select(name,appid) %>%
+  distinct() %>%
+  mutate(info = NA)
+
+while (any(is.na(game_info$info))) {
+  for (ii in 1:nrow(game_info)) {
+    if (is.na(game_info$info[ii])) {
+      game_info$info[ii] = try(get_steam_info(game_info$appid[ii]))
+    }
+  }
+}
+  
 ```
 
